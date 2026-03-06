@@ -3,7 +3,8 @@ import csv
 import os
 import re
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -389,6 +390,12 @@ def main():
         default=1,
         help="Number of worker processes for batch mode (1 = single-process)",
     )
+    parser.add_argument(
+        "--progress_every",
+        type=int,
+        default=200,
+        help="Print progress summary every N completed tasks in batch mode",
+    )
     args = parser.parse_args()
 
     if args.id_list is not None:
@@ -460,17 +467,38 @@ def main():
 
         workers = max(1, int(args.num_workers))
         print(f"batch_exec pending={len(pending_tasks)} num_workers={workers}")
+        total_pending = len(pending_tasks)
+        done_cnt = 0
+        dry_cnt = 0
+        err_cnt = 0
+        completed = 0
+        progress_every = max(1, int(args.progress_every))
+        start_t = time.time()
+
+        def _report_progress(force: bool = False):
+            if not force and completed % progress_every != 0:
+                return
+            elapsed = max(1e-9, time.time() - start_t)
+            rate = completed / elapsed
+            remain = total_pending - completed
+            eta_sec = remain / max(rate, 1e-9)
+            print(
+                f"progress {completed}/{total_pending} "
+                f"done={done_cnt} dry_run={dry_cnt} error={err_cnt} "
+                f"rate={rate:.2f}/s eta={eta_sec/60:.1f}m",
+                flush=True,
+            )
+
         if workers == 1 or len(pending_tasks) == 0:
             for task in pending_tasks:
                 result = run_single_task(task)
-                if result["status"] == "dry_run":
-                    print(
-                        f"[{result['idx']}/{result['total']}] dry_run: id={result['id']} "
-                        f"s3_uri={result['s3_uri']}"
-                    )
-                elif result["status"] == "done":
-                    print(f"[{result['idx']}/{result['total']}] done: {result['output_npz']}")
+                completed += 1
+                if result["status"] == "done":
+                    done_cnt += 1
+                elif result["status"] == "dry_run":
+                    dry_cnt += 1
                 else:
+                    err_cnt += 1
                     print(
                         f"[{result['idx']}/{result['total']}] skip_error: "
                         f"id={result['id']} err={result['error']}"
@@ -483,18 +511,20 @@ def main():
                         "error": result["error"],
                     }
                 )
+                _report_progress()
         else:
             chunksize = max(1, len(pending_tasks) // (workers * 16))
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                for result in executor.map(run_single_task, pending_tasks, chunksize=chunksize):
-                    if result["status"] == "dry_run":
-                        print(
-                            f"[{result['idx']}/{result['total']}] dry_run: id={result['id']} "
-                            f"s3_uri={result['s3_uri']}"
-                        )
-                    elif result["status"] == "done":
-                        print(f"[{result['idx']}/{result['total']}] done: {result['output_npz']}")
+                futures = [executor.submit(run_single_task, task) for task in pending_tasks]
+                for fut in as_completed(futures):
+                    result = fut.result()
+                    completed += 1
+                    if result["status"] == "done":
+                        done_cnt += 1
+                    elif result["status"] == "dry_run":
+                        dry_cnt += 1
                     else:
+                        err_cnt += 1
                         print(
                             f"[{result['idx']}/{result['total']}] skip_error: "
                             f"id={result['id']} err={result['error']}"
@@ -507,6 +537,9 @@ def main():
                             "error": result["error"],
                         }
                     )
+                    _report_progress()
+
+        _report_progress(force=True)
 
         if args.batch_status_csv is None:
             status_csv = os.path.join(out_dir, "batch_status.csv")
