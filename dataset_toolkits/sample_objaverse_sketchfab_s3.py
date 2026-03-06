@@ -3,6 +3,7 @@ import csv
 import os
 import re
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -24,6 +25,21 @@ class InstanceRecord:
     file_identifier: str
     # Generic source object id used in S3 key (e.g., sketchfab id or github uuid id).
     sketchfab_id: str
+
+
+@dataclass
+class BatchTask:
+    idx: int
+    total: int
+    raw_id: str
+    output_npz: str
+    s3_prefix: str
+    num_points: int
+    save_ply: bool
+    dry_run: bool
+    sha256: str
+    file_identifier: str
+    source_id: str
 
 
 def parse_sketchfab_id(file_identifier: str) -> str:
@@ -193,6 +209,66 @@ def sample_points_from_obj(
                 os.remove(local_obj)
 
 
+def run_single_task(task: BatchTask) -> dict:
+    record = InstanceRecord(
+        sha256=task.sha256,
+        file_identifier=task.file_identifier,
+        sketchfab_id=task.source_id,
+    )
+    s3_uri = f"{task.s3_prefix.rstrip('/')}/{record.sketchfab_id}/model.obj"
+
+    if task.dry_run:
+        return {
+            "idx": task.idx,
+            "total": task.total,
+            "id": task.raw_id,
+            "status": "dry_run",
+            "output_npz": task.output_npz,
+            "error": "",
+            "s3_uri": s3_uri,
+        }
+
+    try:
+        points, normals = sample_points_from_obj(
+            s3_uri=s3_uri,
+            num_points=task.num_points,
+        )
+        np.savez_compressed(
+            task.output_npz,
+            points=points,
+            normals=normals,
+            sha256=record.sha256,
+            file_identifier=record.file_identifier,
+            source_id=record.sketchfab_id,
+            sketchfab_id=record.sketchfab_id,
+            s3_uri=s3_uri,
+        )
+        if task.save_ply:
+            ply_path = os.path.splitext(task.output_npz)[0] + ".ply"
+            cloud = trimesh.points.PointCloud(points)
+            cloud.export(ply_path)
+
+        return {
+            "idx": task.idx,
+            "total": task.total,
+            "id": task.raw_id,
+            "status": "done",
+            "output_npz": task.output_npz,
+            "error": "",
+            "s3_uri": s3_uri,
+        }
+    except Exception as e:
+        return {
+            "idx": task.idx,
+            "total": task.total,
+            "id": task.raw_id,
+            "status": "error",
+            "output_npz": task.output_npz,
+            "error": str(e),
+            "s3_uri": s3_uri,
+        }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -291,6 +367,12 @@ def main():
         default=None,
         help="Optional CSV to save per-id status in batch mode",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for batch mode (1 = single-process)",
+    )
     args = parser.parse_args()
 
     if args.id_list is not None:
@@ -308,6 +390,7 @@ def main():
             ids = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
         status_rows = []
+        pending_tasks = []
         for idx, raw_id in enumerate(ids, start=1):
             if args.id_field == "source_id":
                 record = InstanceRecord(
@@ -334,44 +417,70 @@ def main():
                 )
                 continue
 
-            if args.dry_run:
-                print(
-                    f"[{idx}/{len(ids)}] dry_run: id={raw_id} "
-                    f"sketchfab_id={record.sketchfab_id} s3_uri={s3_uri}"
-                )
-                status_rows.append(
-                    {"id": raw_id, "status": "dry_run", "output_npz": output_npz, "error": ""}
-                )
-                continue
-
-            try:
-                points, normals = sample_points_from_obj(
-                    s3_uri=s3_uri,
+            pending_tasks.append(
+                BatchTask(
+                    idx=idx,
+                    total=len(ids),
+                    raw_id=raw_id,
+                    output_npz=output_npz,
+                    s3_prefix=args.s3_prefix,
                     num_points=args.num_points,
-                )
-                np.savez_compressed(
-                    output_npz,
-                    points=points,
-                    normals=normals,
+                    save_ply=args.save_ply,
+                    dry_run=args.dry_run,
                     sha256=record.sha256,
                     file_identifier=record.file_identifier,
                     source_id=record.sketchfab_id,
-                    sketchfab_id=record.sketchfab_id,
-                    s3_uri=s3_uri,
                 )
-                if args.save_ply:
-                    ply_path = os.path.splitext(output_npz)[0] + ".ply"
-                    cloud = trimesh.points.PointCloud(points)
-                    cloud.export(ply_path)
-                print(f"[{idx}/{len(ids)}] done: {output_npz}")
+            )
+
+        workers = max(1, int(args.num_workers))
+        print(f"batch_exec pending={len(pending_tasks)} num_workers={workers}")
+        if workers == 1 or len(pending_tasks) == 0:
+            for task in pending_tasks:
+                result = run_single_task(task)
+                if result["status"] == "dry_run":
+                    print(
+                        f"[{result['idx']}/{result['total']}] dry_run: id={result['id']} "
+                        f"s3_uri={result['s3_uri']}"
+                    )
+                elif result["status"] == "done":
+                    print(f"[{result['idx']}/{result['total']}] done: {result['output_npz']}")
+                else:
+                    print(
+                        f"[{result['idx']}/{result['total']}] skip_error: "
+                        f"id={result['id']} err={result['error']}"
+                    )
                 status_rows.append(
-                    {"id": raw_id, "status": "done", "output_npz": output_npz, "error": ""}
+                    {
+                        "id": result["id"],
+                        "status": result["status"],
+                        "output_npz": result["output_npz"],
+                        "error": result["error"],
+                    }
                 )
-            except Exception as e:
-                print(f"[{idx}/{len(ids)}] skip_error: id={raw_id} err={e}")
-                status_rows.append(
-                    {"id": raw_id, "status": "error", "output_npz": output_npz, "error": str(e)}
-                )
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                for result in executor.map(run_single_task, pending_tasks, chunksize=1):
+                    if result["status"] == "dry_run":
+                        print(
+                            f"[{result['idx']}/{result['total']}] dry_run: id={result['id']} "
+                            f"s3_uri={result['s3_uri']}"
+                        )
+                    elif result["status"] == "done":
+                        print(f"[{result['idx']}/{result['total']}] done: {result['output_npz']}")
+                    else:
+                        print(
+                            f"[{result['idx']}/{result['total']}] skip_error: "
+                            f"id={result['id']} err={result['error']}"
+                        )
+                    status_rows.append(
+                        {
+                            "id": result["id"],
+                            "status": result["status"],
+                            "output_npz": result["output_npz"],
+                            "error": result["error"],
+                        }
+                    )
 
         if args.batch_status_csv is None:
             status_csv = os.path.join(out_dir, "batch_status.csv")
