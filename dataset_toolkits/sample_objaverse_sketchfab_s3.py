@@ -22,6 +22,7 @@ DEFAULT_S3_PREFIX = (
 class InstanceRecord:
     sha256: str
     file_identifier: str
+    # Generic source object id used in S3 key (e.g., sketchfab id or github uuid id).
     sketchfab_id: str
 
 
@@ -230,6 +231,12 @@ def main():
         help="Select instance by sketchfab id (32 hex chars)",
     )
     parser.add_argument(
+        "--source_id",
+        type=str,
+        default=None,
+        help="Direct source object id used in S3 path (.../<source_id>/model.obj)",
+    )
+    parser.add_argument(
         "--num_points",
         type=int,
         default=8192,
@@ -263,7 +270,7 @@ def main():
     parser.add_argument(
         "--id_field",
         type=str,
-        choices=["sha256", "sketchfab_id", "file_identifier"],
+        choices=["sha256", "sketchfab_id", "file_identifier", "source_id"],
         default="sketchfab_id",
         help="Which field --id_list lines represent",
     )
@@ -287,7 +294,8 @@ def main():
     args = parser.parse_args()
 
     if args.id_list is not None:
-        metadata = load_metadata_with_sketchfab_id(args.metadata_csv)
+        need_metadata = args.id_field != "source_id"
+        metadata = load_metadata_with_sketchfab_id(args.metadata_csv) if need_metadata else None
         if args.output_dir is None:
             out_dir = os.path.normpath(
                 os.path.join(os.path.dirname(args.metadata_csv), "samples")
@@ -301,13 +309,20 @@ def main():
 
         status_rows = []
         for idx, raw_id in enumerate(ids, start=1):
-            record = resolve_instance_from_df(metadata, args.id_field, raw_id)
-            if record is None:
-                print(f"[{idx}/{len(ids)}] skip_not_in_metadata: {raw_id}")
-                status_rows.append(
-                    {"id": raw_id, "status": "not_in_metadata", "output_npz": "", "error": ""}
+            if args.id_field == "source_id":
+                record = InstanceRecord(
+                    sha256="",
+                    file_identifier="",
+                    sketchfab_id=raw_id,
                 )
-                continue
+            else:
+                record = resolve_instance_from_df(metadata, args.id_field, raw_id)
+                if record is None:
+                    print(f"[{idx}/{len(ids)}] skip_not_in_metadata: {raw_id}")
+                    status_rows.append(
+                        {"id": raw_id, "status": "not_in_metadata", "output_npz": "", "error": ""}
+                    )
+                    continue
 
             s3_uri = f"{args.s3_prefix.rstrip('/')}/{record.sketchfab_id}/model.obj"
             output_npz = os.path.join(out_dir, f"{record.sketchfab_id}_{args.num_points}.npz")
@@ -340,6 +355,7 @@ def main():
                     normals=normals,
                     sha256=record.sha256,
                     file_identifier=record.file_identifier,
+                    source_id=record.sketchfab_id,
                     sketchfab_id=record.sketchfab_id,
                     s3_uri=s3_uri,
                 )
@@ -380,12 +396,19 @@ def main():
         print(f"status_csv: {status_csv}")
         return
 
-    instance = load_instance_from_metadata(
-        metadata_csv=args.metadata_csv,
-        sha256=args.sha256,
-        file_identifier=args.file_identifier,
-        sketchfab_id=args.sketchfab_id,
-    )
+    if args.source_id is not None:
+        instance = InstanceRecord(
+            sha256="",
+            file_identifier="",
+            sketchfab_id=args.source_id,
+        )
+    else:
+        instance = load_instance_from_metadata(
+            metadata_csv=args.metadata_csv,
+            sha256=args.sha256,
+            file_identifier=args.file_identifier,
+            sketchfab_id=args.sketchfab_id,
+        )
 
     s3_uri = f"{args.s3_prefix.rstrip('/')}/{instance.sketchfab_id}/model.obj"
 
@@ -417,6 +440,7 @@ def main():
         normals=normals,
         sha256=instance.sha256,
         file_identifier=instance.file_identifier,
+        source_id=instance.sketchfab_id,
         sketchfab_id=instance.sketchfab_id,
         s3_uri=s3_uri,
     )
