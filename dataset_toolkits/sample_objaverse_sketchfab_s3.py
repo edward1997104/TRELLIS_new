@@ -180,13 +180,16 @@ def sample_points_from_obj(
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         local_obj = os.path.join(tmp_dir, "model.obj")
-        s3.download_file(bucket, key, local_obj)
-
-        loaded = trimesh.load(local_obj, force="scene", process=False)
-        mesh = scene_to_mesh(loaded)
-        points, face_idx = trimesh.sample.sample_surface(mesh, num_points)
-        normals = mesh.face_normals[face_idx]
-        return points.astype(np.float32), normals.astype(np.float32)
+        try:
+            s3.download_file(bucket, key, local_obj)
+            loaded = trimesh.load(local_obj, force="scene", process=False)
+            mesh = scene_to_mesh(loaded)
+            points, face_idx = trimesh.sample.sample_surface(mesh, num_points)
+            normals = mesh.face_normals[face_idx]
+            return points.astype(np.float32), normals.astype(np.float32)
+        finally:
+            if os.path.exists(local_obj):
+                os.remove(local_obj)
 
 
 def main():
