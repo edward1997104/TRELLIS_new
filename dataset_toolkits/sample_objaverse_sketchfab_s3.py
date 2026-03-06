@@ -170,6 +170,22 @@ def resolve_instance_from_df(
     )
 
 
+def build_instance_lookup(metadata: pd.DataFrame, id_field: str) -> dict[str, InstanceRecord]:
+    if id_field not in {"sha256", "file_identifier", "sketchfab_id"}:
+        raise ValueError(f"Unsupported id_field for lookup: {id_field}")
+    lookup: dict[str, InstanceRecord] = {}
+    for row in metadata.itertuples(index=False):
+        record = InstanceRecord(
+            sha256=str(row.sha256),
+            file_identifier=str(row.file_identifier),
+            sketchfab_id=str(row.sketchfab_id),
+        )
+        key = getattr(row, id_field)
+        if key not in lookup:
+            lookup[str(key)] = record
+    return lookup
+
+
 def scene_to_mesh(scene_or_mesh: trimesh.Scene | trimesh.Trimesh) -> trimesh.Trimesh:
     if isinstance(scene_or_mesh, trimesh.Trimesh):
         if scene_or_mesh.faces is None or len(scene_or_mesh.faces) == 0:
@@ -377,7 +393,14 @@ def main():
 
     if args.id_list is not None:
         need_metadata = args.id_field != "source_id"
-        metadata = load_metadata_with_sketchfab_id(args.metadata_csv) if need_metadata else None
+        metadata = None
+        metadata_lookup = None
+        if need_metadata:
+            print(f"Loading metadata from {args.metadata_csv} ...")
+            metadata = load_metadata_with_sketchfab_id(args.metadata_csv)
+            print(f"Metadata loaded rows={len(metadata)}. Building lookup by {args.id_field} ...")
+            metadata_lookup = build_instance_lookup(metadata, args.id_field)
+            print(f"Lookup built entries={len(metadata_lookup)}")
         if args.output_dir is None:
             out_dir = os.path.normpath(
                 os.path.join(os.path.dirname(args.metadata_csv), "samples")
@@ -399,7 +422,7 @@ def main():
                     sketchfab_id=raw_id,
                 )
             else:
-                record = resolve_instance_from_df(metadata, args.id_field, raw_id)
+                record = metadata_lookup.get(raw_id)
                 if record is None:
                     print(f"[{idx}/{len(ids)}] skip_not_in_metadata: {raw_id}")
                     status_rows.append(
@@ -432,6 +455,8 @@ def main():
                     source_id=record.sketchfab_id,
                 )
             )
+            if idx % 5000 == 0:
+                print(f"Prepared tasks: {idx}/{len(ids)}")
 
         workers = max(1, int(args.num_workers))
         print(f"batch_exec pending={len(pending_tasks)} num_workers={workers}")
@@ -459,8 +484,9 @@ def main():
                     }
                 )
         else:
+            chunksize = max(1, len(pending_tasks) // (workers * 16))
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                for result in executor.map(run_single_task, pending_tasks, chunksize=1):
+                for result in executor.map(run_single_task, pending_tasks, chunksize=chunksize):
                     if result["status"] == "dry_run":
                         print(
                             f"[{result['idx']}/{result['total']}] dry_run: id={result['id']} "
